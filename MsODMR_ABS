@@ -1,0 +1,197 @@
+import os
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy.signal import find_peaks
+
+# === CONFIG ===
+folder = r"C:\Users\Oshar\OneDrive\Desktop\OceanView Master Data\R9 Graphs\FMN_TCEP_T1"
+x_min, x_max = 300, 500          # integration range
+output_file = "key_spectra.png"  #final saved plot
+smooth_window = 237                # moving average window size (odd number)
+
+# === FUNCTION TO READ EACH FILE ===
+def read_spectrum(filepath):
+    filename = os.path.basename(filepath)
+
+    # Look for time in filename: HH MM SS mmm
+    # Accepts separators "-", "_", or ":"
+    match = re.search(r"(\d{2})[-_:](\d{2})[-_:](\d{2})[-_:](\d{3})", filename)
+
+    if not match:
+        raise ValueError(f"No time found in filename: {filename}")
+
+    hh, mm, ss, ms = map(int, match.groups())
+
+    # Convert to total seconds (float)
+    timestamp_seconds = hh*3600 + mm*60 + ss + ms/1000.0
+
+    # Extract numeric data (first two columns)
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    data = []
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            try:
+                x, y = float(parts[0]), float(parts[1])
+                data.append((x, y))
+            except ValueError:
+                continue
+
+    if not data:
+        raise ValueError(f"No numeric data found in {filepath}")
+
+    data = np.array(data)
+    return data[:, 0], data[:, 1], timestamp_seconds
+
+
+# === READ ALL FILES ===
+spectra = []
+for filename in sorted(os.listdir(folder)):
+    if filename.lower().endswith(".txt"):
+        filepath = os.path.join(folder, filename)
+        try:
+            x, y, time_str = read_spectrum(filepath)
+            spectra.append((x, y, time_str))
+            print(f"Loaded: {filename} ({time_str})")
+        except Exception as e:
+            print(f"Skipping {filename}: {e}")
+
+if not spectra:
+    raise RuntimeError("No valid spectra found.")
+
+# === CONVERT TIMES TO SECONDS RELATIVE TO EARLIEST ===
+def time_to_seconds(t_str):
+    t = datetime.strptime(t_str, "%H:%M:%S")
+    return t.hour * 3600 + t.minute * 60 + t.second
+
+# === CONVERT TIMES TO RELATIVE SECONDS ===
+times_raw = [t for _, _, t in spectra]
+t0 = min(times_raw)
+times_rel = np.array([t - t0 for t in times_raw])
+
+# Sort spectra by time
+sorted_idx = np.argsort(times_rel)
+spectra = [spectra[i] for i in sorted_idx]
+times_rel = times_rel[sorted_idx]
+
+
+# === INTEGRATE EACH SPECTRUM BETWEEN 495–675 WITH BASELINE CORRECTION ===
+integrations = []
+for (x, y, _) in spectra:
+    
+    # --- BASELINE ESTIMATION (200–400 nm) ---
+    baseline_mask = (x >= 650) & (x <= 850)
+    if np.any(baseline_mask):
+        baseline_region = y[baseline_mask]
+        
+        # Option 1 (recommended): Median (robust to outliers)
+        baseline = np.median(baseline_region)
+
+        # Option 2 (explicit outlier rejection):
+        # mean = np.mean(baseline_region)
+        # std = np.std(baseline_region)
+        # filtered = baseline_region[(baseline_region > mean - 2*std) & (baseline_region < mean + 2*std)]
+        # baseline = np.mean(filtered) if len(filtered) > 0 else mean
+
+    else:
+        baseline = 0  # fallback
+    
+    # Subtract baseline
+    y_corrected = y - baseline
+    
+    # Perform integration using corrected spectrum
+    mask = (x >= x_min) & (x <= x_max)
+    area = np.trapezoid(y_corrected[mask], x[mask]) if np.any(mask) else 0
+    integrations.append(area)
+
+integrations = np.array(integrations)
+
+# === SHOW AN EXAMPLE OF A BASELINE-SUBTRACTED SPECTRUM ===
+import random
+
+# pick a random file index
+example_idx = random.randrange(len(spectra))
+x_ex, y_ex, _ = spectra[example_idx]
+
+# compute the same baseline used in integration
+baseline_mask = (x_ex >= 650) & (x_ex <= 850)
+if np.any(baseline_mask):
+    baseline_example = np.median(y_ex[baseline_mask])
+else:
+    baseline_example = 0
+
+# subtract baseline
+y_ex_corrected = y_ex - baseline_example
+
+# plot
+plt.figure(figsize=(8, 4))
+plt.plot(x_ex, y_ex, label="Original", alpha=0.6)
+plt.plot(x_ex, y_ex_corrected, label="Baseline Subtracted", linewidth=2)
+plt.axhline(0, color='k', linestyle='--', alpha=0.5)
+plt.xlabel("Wavelength (nm)")
+plt.ylabel("Intensity")
+plt.title("Example Baseline-Subtracted Spectrum")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print(f"Displayed example baseline-subtracted spectrum: index {example_idx}")
+
+
+
+# === WRITE INTEGRATED AREA VS TIME TO FILE ===
+folder_name = os.path.basename(folder.rstrip("/\\"))
+output_txt = f"{folder_name}.txt"
+output_path = os.path.join(os.getcwd(), output_txt)
+
+with open(output_path, 'w') as f:
+    f.write("Time_seconds\tIntegrated_Area\n")
+    for t, area in zip(times_rel, integrations):
+        f.write(f"{t:.2f}\t{area:.6f}\n")
+
+print(f"Saved integrated area vs time to: {output_path}")
+
+
+# === PLOT INTEGRATION + SMOOTH ===
+plt.figure(figsize=(9, 5))
+plt.plot(times_rel, integrations, 'o', label="Integrated data", alpha=0.6)
+plt.xlabel("Time (s since first)")
+plt.ylabel(f"Integrated Area ({x_min}-{x_max})")
+plt.title("Integrated Area vs Time (Smoothed)")
+plt.grid(True)
+
+# === FINAL PLOT: KEY SPECTRA ===
+plt.figure(figsize=(10, 6))
+colors = plt.cm.tab10(np.linspace(0, 1))
+
+# === PREVIEW: INTEGRATION VS TIME ===
+import pandas as pd
+
+# Create a DataFrame for clean display
+df = pd.DataFrame({
+    "Time (s)": times_rel,
+    "Integrated Area": integrations
+})
+
+# Print first ~10 rows (like a preview)
+print("\n=== Preview of Integrated Data ===")
+print(df.head(10).to_string(index=False))
+
+# Optional: show last few too
+print("\n=== Final Timepoints ===")
+print(df.tail(5).to_string(index=False))
+
+
+# === PLOT PREVIEW (LIKE BASELINE EXAMPLE) ===
+plt.figure(figsize=(8, 4))
+plt.plot(times_rel, integrations, 'o-', alpha=0.7)
+plt.xlabel("Time (s since first)")
+plt.ylabel(f"Integrated Area ({x_min}-{x_max})")
+plt.title("Preview: Integrated Area vs Time")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
