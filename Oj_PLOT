@@ -1,0 +1,114 @@
+import os
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ===== USER SETTINGS =====
+folder_path = r"C:\Users\Oshar\OneDrive\Desktop\OceanView Master Data\FMN_CYS_TCEP_T4"  # Folder containing the .txt files
+wavelengths_of_interest = [310.242,427.507]  # Replace with your desired wavelengths
+tolerance = 0.5  # How close a wavelength has to be to match (nm)
+folder_name = os.path.basename(folder_path.rstrip("/\\"))
+output_file = f"{folder_name}.txt"
+
+# ===== FUNCTIONS =====
+def parse_time_from_filename(filename):
+    """Extract time from filename formatted like __HH-MM-SS-ms.txt"""
+    match = re.search(r"__(\d+)-(\d+)-(\d+)-(\d+)\.txt$", filename)
+    if match:
+        h, m, s, ms = map(int, match.groups())
+        return h*3600 + m*60 + s + ms/1000
+    else:
+        return None
+
+def read_spectrum(file_path):
+    """Read wavelengths and intensities from the spectral file"""
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+    start_index = next(i for i, line in enumerate(lines) if ">>>>>Begin Spectral Data<<<<<" in line) + 1
+    data = []
+    for line in lines[start_index:]:
+        parts = line.strip().split()
+        for i in range(0, len(parts), 2):
+            try:
+                wl = float(parts[i])
+                inten = float(parts[i+1])
+                data.append((wl, inten))
+            except:
+                continue
+    data = np.array(data)
+    return data[:,0], data[:,1]
+
+# ===== MAIN SCRIPT =====
+all_files = [f for f in os.listdir(folder_path) if f.endswith(".txt")]
+
+# Parse times and keep pairs (time, filename)
+time_file_pairs = []
+for file in all_files:
+    t = parse_time_from_filename(file)
+    if t is not None:
+        time_file_pairs.append((t, file))
+
+# Sort by time
+time_file_pairs.sort(key=lambda x: x[0])
+
+time_points = []
+spectra = {wl: [] for wl in wavelengths_of_interest}
+all_corrected_spectra = {}
+
+for t, file in time_file_pairs:
+    time_points.append(t)
+    
+    wls, ints = read_spectrum(os.path.join(folder_path, file))
+    
+    # ---- BASELINE CORRECTION (580–600 nm average = 0) ----
+    baseline_mask = (wls >= 515) & (wls <= 565)
+    baseline = np.mean(ints[baseline_mask])
+    ints_corrected = ints - baseline
+    all_corrected_spectra[file] = (wls, ints_corrected)
+    
+    for target_wl in wavelengths_of_interest:
+        idx = np.argmin(np.abs(wls - target_wl))
+        spectra[target_wl].append(ints_corrected[idx])
+
+# Convert lists to arrays and set t=0
+time_points = np.array(time_points)
+for wl in spectra:
+    spectra[wl] = np.array(spectra[wl])
+
+# ===== RANDOM SPECTRUM PLOT (baseline shown) =====
+import random
+random_file = random.choice(list(all_corrected_spectra.keys()))
+wls_plot, ints_plot = all_corrected_spectra[random_file]
+
+plt.figure(figsize=(8,5))
+plt.plot(wls_plot, ints_plot, label="Baseline-corrected spectrum")
+plt.axhline(0, color='r', linestyle='--', label="Baseline (550–600 nm = 0)")
+plt.xlabel("Wavelength (nm)")
+plt.ylabel("Intensity (baseline-corrected)")
+plt.title(f"Random Spectrum with Baseline Correction\n{random_file}")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ===== INTENSITY vs TIME PLOT =====
+plt.figure(figsize=(8,5))
+for wl in wavelengths_of_interest:
+    plt.plot(time_points, spectra[wl], marker='o', linestyle='None', label=f"{wl} nm")
+plt.xlabel("Time (s, t=0 start)")
+plt.ylabel("Intensity (baseline-corrected)")
+plt.title("Spectral Intensities vs Time (Baseline 550–600 nm = 0)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ===== SAVE DATA TO TEXT FILE =====
+with open(output_file, 'w') as f:
+    f.write("Time(s)\t" + "\t".join([f"{wl}nm" for wl in wavelengths_of_interest]) + "\n")
+    for i, t in enumerate(time_points):
+        line = [f"{t:.3f}"] + [f"{spectra[wl][i]:.5f}" for wl in wavelengths_of_interest]
+        f.write("\t".join(line) + "\n")
+
+print(f"Processed data saved to: {output_file}")
+print(f"Random spectrum plotted: {random_file}")
