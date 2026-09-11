@@ -1,0 +1,240 @@
+[msODMR_integral_txt (1).py](https://github.com/user-attachments/files/32127151/msODMR_integral_txt.1.py)
+import os
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy.signal import find_peaks
+
+# === CONFIG ===
+folder = r"C:\Users\Oshar\Downloads\FMN_CYS_TCEP_T2_pH.txt"  # 👈 change this to your folder
+x_min, x_max = 200, 500          # integration range
+output_file = "key_spectra.png"  # final saved plot
+smooth_window = 237              # moving average window size (odd number)
+
+# === FUNCTION TO READ EACH FILE ===
+def read_spectrum(filepath):
+    """
+    Reads one Ocean Optics-style .txt export.
+
+    Timing strategy:
+    - The 'Date:' header line only has 1-second resolution, which is not
+      enough to order/space out files acquired faster than 1/sec.
+    - The trailing integer in the filename (e.g. ..._1146.txt) is the
+      acquisition/scan index and is what we actually use for ordering
+      and for building a fine-grained time axis (index * integration_time).
+    - We still parse 'Date:' and keep it around for reference/sanity checks,
+      but it is not used as the primary clock.
+    """
+    filename = os.path.basename(filepath)
+
+    # --- Scan index from filename (trailing integer before .txt) ---
+    idx_match = re.search(r"_(\d+)\.txt$", filename)
+    if not idx_match:
+        raise ValueError(f"No trailing scan index found in filename: {filename}")
+    scan_index = int(idx_match.group(1))
+
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    # --- Coarse wall-clock timestamp from the 'Date:' header line ---
+    date_dt = None
+    integration_time = None
+    data_start = None
+
+    for i, line in enumerate(lines):
+        if line.startswith("Date:"):
+            date_str = line[len("Date:"):].strip()
+            # Example: "Sat Aug 22 09:11:01 Pacific Daylight Time 2026"
+            # Strip the timezone name (not parseable by strptime directly)
+            m = re.match(
+                r"(\w{3} \w{3} \d{1,2} \d{2}:\d{2}:\d{2}) .*?(\d{4})$",
+                date_str,
+            )
+            if m:
+                clean_str = f"{m.group(1)} {m.group(2)}"
+                try:
+                    date_dt = datetime.strptime(clean_str, "%a %b %d %H:%M:%S %Y")
+                except ValueError:
+                    date_dt = None
+
+        elif line.startswith("Integration Time"):
+            try:
+                integration_time = float(line.split(":")[1].strip())
+            except (IndexError, ValueError):
+                integration_time = None
+
+        elif line.strip().startswith(">>>>>Begin Spectral Data"):
+            data_start = i + 1
+            break
+
+    if data_start is None:
+        raise ValueError(f"Could not find spectral data section in {filename}")
+
+    # --- Parse numeric (wavelength, intensity) pairs after the header ---
+    data = []
+    for line in lines[data_start:]:
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            try:
+                x, y = float(parts[0]), float(parts[1])
+                data.append((x, y))
+            except ValueError:
+                continue
+
+    if not data:
+        raise ValueError(f"No numeric data found in {filepath}")
+
+    data = np.array(data)
+    return data[:, 0], data[:, 1], scan_index, date_dt, integration_time
+
+
+# === READ ALL FILES ===
+spectra = []
+skipped_copies = 0
+
+for filename in sorted(os.listdir(folder)):
+    if not filename.lower().endswith(".txt"):
+        continue
+
+    # Skip accidental duplicate files (e.g. "... - Copy.txt", "...(1).txt")
+    if re.search(r"-\s*copy", filename, re.IGNORECASE) or re.search(r"\(\d+\)\.txt$", filename, re.IGNORECASE):
+        skipped_copies += 1
+        continue
+
+    filepath = os.path.join(folder, filename)
+    try:
+        x, y, scan_index, date_dt, integ_time = read_spectrum(filepath)
+        spectra.append((x, y, scan_index, date_dt, integ_time))
+    except Exception as e:
+        print(f"Skipping {filename}: {e}")
+
+if not spectra:
+    raise RuntimeError("No valid spectra found.")
+
+print(f"Loaded {len(spectra)} spectra "
+      f"({skipped_copies} duplicate/copy files skipped).")
+
+# === SORT BY SCAN INDEX (this is our real acquisition order) ===
+spectra.sort(key=lambda s: s[2])
+
+# === BUILD TIME AXIS FROM SCAN INDEX * INTEGRATION TIME ===
+# Falls back to a default of 0.1 s if a file is somehow missing the
+# Integration Time header (shouldn't happen with this instrument export).
+default_integration_time = next(
+    (s[4] for s in spectra if s[4] is not None), 0.1
+)
+scan_indices = np.array([s[2] for s in spectra])
+idx0 = scan_indices[0]
+integration_times = np.array(
+    [s[4] if s[4] is not None else default_integration_time for s in spectra]
+)
+# Relative time = (scan index - first scan index) * integration time.
+# This spaces files out proportionally even if some indices are missing
+# (e.g. a corrupted/deleted file), rather than pretending acquisitions
+# were perfectly back-to-back.
+times_rel = (scan_indices - idx0) * integration_times
+
+# Sanity check against the coarse Date: timestamps, if available
+dated = [(t, d) for t, (_, _, _, d, _) in zip(times_rel, spectra) if d is not None]
+if len(dated) >= 2:
+    span_from_index = times_rel[-1] - times_rel[0]
+    span_from_dates = (dated[-1][1] - dated[0][1]).total_seconds()
+    print(f"Time span from scan index * integration time: {span_from_index:.2f} s")
+    print(f"Time span from Date: header (1 s resolution):  {span_from_dates:.2f} s")
+
+
+# === INTEGRATE EACH SPECTRUM BETWEEN x_min-x_max WITH BASELINE CORRECTION ===
+integrations = []
+for (x, y, _, _, _) in spectra:
+
+    # --- BASELINE ESTIMATION (200-400 nm) ---
+    baseline_mask = (x >= 200) & (x <= 400)
+    if np.any(baseline_mask):
+        baseline_region = y[baseline_mask]
+        baseline = np.median(baseline_region)  # robust to outliers
+    else:
+        baseline = 0  # fallback
+
+    y_corrected = y - baseline
+
+    mask = (x >= x_min) & (x <= x_max)
+    area = np.trapezoid(y_corrected[mask], x[mask]) if np.any(mask) else 0
+    integrations.append(area)
+
+integrations = np.array(integrations)
+
+# === SHOW AN EXAMPLE OF A BASELINE-SUBTRACTED SPECTRUM ===
+import random
+
+example_idx = random.randrange(len(spectra))
+x_ex, y_ex, scan_idx_ex, date_ex, _ = spectra[example_idx]
+
+baseline_mask = (x_ex >= 200) & (x_ex <= 400)
+baseline_example = np.median(y_ex[baseline_mask]) if np.any(baseline_mask) else 0
+y_ex_corrected = y_ex - baseline_example
+
+plt.figure(figsize=(8, 4))
+plt.plot(x_ex, y_ex, label="Original", alpha=0.6)
+plt.plot(x_ex, y_ex_corrected, label="Baseline Subtracted", linewidth=2)
+plt.axhline(0, color='k', linestyle='--', alpha=0.5)
+plt.xlabel("Wavelength (nm)")
+plt.ylabel("Intensity")
+plt.title(f"Example Baseline-Subtracted Spectrum (scan #{scan_idx_ex})")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print(f"Displayed example baseline-subtracted spectrum: scan index {scan_idx_ex}")
+
+
+# === WRITE INTEGRATED AREA VS TIME TO FILE ===
+folder_name = os.path.basename(folder.rstrip("/\\"))
+output_txt = f"{folder_name}.txt"
+output_path = os.path.join(os.getcwd(), output_txt)
+
+with open(output_path, 'w') as f:
+    f.write("Time_seconds\tIntegrated_Area\n")
+    for t, area in zip(times_rel, integrations):
+        f.write(f"{t:.3f}\t{area:.6f}\n")
+
+print(f"Saved integrated area vs time to: {output_path}")
+
+
+# === PLOT INTEGRATION + SMOOTH ===
+plt.figure(figsize=(9, 5))
+plt.plot(times_rel, integrations, 'o', label="Integrated data", alpha=0.6)
+plt.xlabel("Time (s since first scan)")
+plt.ylabel(f"Integrated Area ({x_min}-{x_max})")
+plt.title("Integrated Area vs Time (Smoothed)")
+plt.grid(True)
+
+# === FINAL PLOT: KEY SPECTRA ===
+plt.figure(figsize=(10, 6))
+colors = plt.cm.tab10(np.linspace(0, 1))
+
+# === PREVIEW: INTEGRATION VS TIME ===
+import pandas as pd
+
+df = pd.DataFrame({
+    "Scan Index": scan_indices,
+    "Time (s)": times_rel,
+    "Integrated Area": integrations
+})
+
+print("\n=== Preview of Integrated Data ===")
+print(df.head(10).to_string(index=False))
+
+print("\n=== Final Timepoints ===")
+print(df.tail(5).to_string(index=False))
+
+
+# === PLOT PREVIEW (LIKE BASELINE EXAMPLE) ===
+plt.figure(figsize=(8, 4))
+plt.plot(times_rel, integrations, 'o-', alpha=0.7)
+plt.xlabel("Time (s since first scan)")
+plt.ylabel(f"Integrated Area ({x_min}-{x_max})")
+plt.title("Preview: Integrated Area vs Time")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
